@@ -294,6 +294,16 @@ func (a *App) reinitAILayer() {
 		a.plannerAgent.SetStockMeta(brainhost.AdaptStockMeta(data.GetDictLoader()))
 	}
 	a.plannerAgent.SetCallMetaDecorator(brainhost.AdaptCallMetaDecoratorLlmtrace())
+	// 注入六维判势市场环境提供者（弱市判断的保守回退，避免 fail-open）
+	if a.duckdbManager != nil {
+		a.plannerAgent.SetSixDimRegimeProvider(func() (string, float64, bool) {
+			rows, err := data.GetMarketSixDimRows(context.Background(), a.duckdbManager, 1)
+			if err != nil || len(rows) == 0 {
+				return "", 0, false
+			}
+			return rows[0].MarketTag, rows[0].PositionRate, true
+		})
+	}
 	log.Printf("[QuantBot] Planner Agent reinitialized with new AI config")
 
 	// 重建 CIO Engine

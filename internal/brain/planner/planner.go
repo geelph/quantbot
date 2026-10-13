@@ -60,6 +60,10 @@ type Planner struct {
 
 	// callMetaDecorator LLM 审计元数据装饰（宿主以 llmmonitoring.WithCallMeta 适配注入）
 	callMetaDecorator port.CallMetaDecorator
+
+	// sixDimRegimeProvider 六维判势市场环境提供者（由 App 注入），返回 (市场标签, 仓位系数, 是否可用)。
+	// 用于在选股市场状态（lastMarketState）缺失时做保守回退判断，避免弱市现金保护静默失效。
+	sixDimRegimeProvider func() (string, float64, bool)
 }
 
 // SetCapitalProvider 注入组合实际可用资金的获取函数
@@ -82,6 +86,11 @@ func (p *Planner) SetCallMetaDecorator(fn port.CallMetaDecorator) {
 	p.callMetaDecorator = fn
 }
 
+// SetSixDimRegimeProvider 注入六维判势市场环境提供者（用于弱市判断的保守回退）。
+func (p *Planner) SetSixDimRegimeProvider(fn func() (string, float64, bool)) {
+	p.sixDimRegimeProvider = fn
+}
+
 // decorateLLMCtx 为 LLM 调用附加审计元信息（宿主注入的指标装饰闭包）
 func (p *Planner) decorateLLMCtx(ctx context.Context, meta port.CallMeta) context.Context {
 	if p.callMetaDecorator != nil {
@@ -90,17 +99,40 @@ func (p *Planner) decorateLLMCtx(ctx context.Context, meta port.CallMeta) contex
 	return ctx
 }
 
-// bearish 判断当前市场是否处于弱势（熊市/偏弱震荡）。
+// bearish 判断当前市场是否处于弱势（熊市/偏弱震荡/退潮）。
 // 弱市时执行「数量减半」与「仓位控制」：减少持仓数并把更多资金留给现金，降低权益暴露。
+//
+// 修复 fail-open：选股市场状态（lastMarketState）缺失时不再直接返回 false
+// （那会让弱市现金保护静默失效），而是回退读取六维判势做保守判断。
 func (p *Planner) bearish() bool {
-	if p.lastMarketState == nil {
+	if p.lastMarketState != nil {
+		switch p.lastMarketState.Regime {
+		case "bear", "bear_range":
+			return true
+		}
 		return false
 	}
-	switch p.lastMarketState.Regime {
-	case "bear", "bear_range":
-		return true
+	if p.sixDimRegimeProvider != nil {
+		if tag, rate, ok := p.sixDimRegimeProvider(); ok {
+			if tag == "退潮风险" || tag == "偏弱" || rate <= 0.3 {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// marketRegimeLabel 返回当前市场状态的展示标签（供日志用，兼容 lastMarketState 缺失的情况）。
+func (p *Planner) marketRegimeLabel() string {
+	if p.lastMarketState != nil {
+		return p.lastMarketState.Regime
+	}
+	if p.sixDimRegimeProvider != nil {
+		if tag, rate, ok := p.sixDimRegimeProvider(); ok {
+			return fmt.Sprintf("六维:%s(%.2f)", tag, rate)
+		}
+	}
+	return "未知"
 }
 
 // NewPlanner 创建投资规划师
@@ -1813,6 +1845,12 @@ func (p *Planner) buildRealStockPool(profile *port.InvestorProfile, mandate *Inv
 
 	// 风险等级 -> 统一的策略模板ID（与选股引擎共用同一解析，避免两套模板割裂）
 	strategyID := port.ResolveTemplateID(mandate.RiskLevel)
+	// 弱市防御资产优先：弱势行情强制切换到「红利价值多头」防御模板，
+	// 使候选池偏向高股息/低波动/高质量价值蓝筹（真实因子打分，非硬编码）。
+	// 结合 applyThreeLayerWeighting 中的弱市现金比例提升，实现"降低权益暴露 + 防御资产优先"；仍为纯多头，不引入做空。
+	if p.bearish() {
+		strategyID = "defensive"
+	}
 
 	req := port.ScreeningRequest{
 		StrategyID:   strategyID,
@@ -1919,7 +1957,7 @@ func (p *Planner) buildCandidatePool(profile *port.InvestorProfile, mandate *Inv
 		if halved < minCandidates {
 			halved = minCandidates
 		}
-		log.Printf("[Planner] 弱市(%s)：候选数量减半 %d -> %d", p.lastMarketState.Regime, maxCandidates, halved)
+		log.Printf("[Planner] 弱市(%s)：候选数量减半 %d -> %d", p.marketRegimeLabel(), maxCandidates, halved)
 		maxCandidates = halved
 	}
 
@@ -2101,7 +2139,7 @@ func (p *Planner) applyThreeLayerWeighting(candidates []CandidateForPortfolio, m
 		if boostedCash > 0.50 {
 			boostedCash = 0.50
 		}
-		log.Printf("[Planner] 弱市(%s)：现金仓位提升 %.0f%% -> %.0f%%（仓位控制）", p.lastMarketState.Regime, cashRatio*100, boostedCash*100)
+		log.Printf("[Planner] 弱市(%s)：现金仓位提升 %.0f%% -> %.0f%%（仓位控制）", p.marketRegimeLabel(), cashRatio*100, boostedCash*100)
 		cashRatio = boostedCash
 	}
 

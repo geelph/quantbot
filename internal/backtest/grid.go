@@ -1,6 +1,7 @@
 package backtest
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/quantpilot/quantpilot/internal/data"
+	sixdim "github.com/quantpilot/quantpilot/internal/marketsixdim"
 	"github.com/quantpilot/quantpilot/internal/tdx"
 )
 
@@ -60,6 +62,21 @@ type GridScanResult struct {
 	OosTrades    int                `json:"oos_trades"`
 	Ranked       []GridComboResult  `json:"ranked"` // 按目标降序
 	Method       string             `json:"method"` // 防前视方法说明
+	// RegimeOOS 分市场环境（牛/熊/震荡）的样本外绩效：暴露"策略在弱市是否仍有效"，
+	// 仅取被选中最优参数的样本外表现；环境过短（<15根）的区间不参与统计。
+	RegimeOOS []RegimeOOSResult `json:"regime_oos"`
+	// RegimeSource 环境标签来源说明（六维判势 / 沪深300 trailing 回退）
+	RegimeSource string `json:"regime_source"`
+}
+
+// RegimeOOSResult 单一市场环境（牛/熊/震荡）下的样本外绩效。
+type RegimeOOSResult struct {
+	Regime string  `json:"regime"`
+	Bars   int     `json:"bars"`
+	Sharpe float64 `json:"sharpe"`
+	Return float64 `json:"return"`
+	MaxDD  float64 `json:"max_dd"`
+	Trades int     `json:"trades"`
 }
 
 // runComboOnSegment 在给定 K 线段上用指定参数跑一次回测，返回样本内关键指标。
@@ -171,6 +188,8 @@ func scanGrid(grid []map[string]float64, bars []tdx.KlineBar, req *RunBacktestRe
 	}
 	best := results[0]
 	oos := runComboOnSegment(req.StrategyType, best.Params, test, req, dm)
+	// 分市场环境（牛/熊/震荡）样本外验证：用真实市场环境数据给样本外K线分层，分别回测最优参数。
+	regimeOOS, regimeSource := computeRegimeOOS(req.StrategyType, best.Params, test, req, dm)
 
 	res := &GridScanResult{
 		StrategyType: req.StrategyType,
@@ -188,11 +207,134 @@ func scanGrid(grid []map[string]float64, bars []tdx.KlineBar, req *RunBacktestRe
 		OosMaxDD:     oos.MaxDrawdown,
 		OosTrades:    oos.TotalTrades,
 		Ranked:       results,
-		Method:       "walk-forward 时间切分：参数在样本内(前70%)评分选优，样本外(后30%)验证，避免用全样本选参产生前视/过拟合。",
+		Method:       "walk-forward 时间切分：参数在样本内(前70%)评分选优，样本外(后30%)验证，避免用全样本选参产生前视/过拟合；样本外再按市场环境(牛/熊/震荡)分层验证弱市鲁棒性。",
+		RegimeOOS:    regimeOOS,
+		RegimeSource: regimeSource,
 	}
-	log.Printf("[BacktestGrid] strategy=%s combos=%d best=%s isSharpe=%.3f oosSharpe=%.3f oosReturn=%.1f%% oosDD=%.1f%% testBars=%d",
-		req.StrategyType, res.CombosTested, best.ParamMsg, best.IsSharpe, res.OosSharpe, res.OosReturn, res.OosMaxDD, res.TestBars)
+	log.Printf("[BacktestGrid] strategy=%s combos=%d best=%s isSharpe=%.3f oosSharpe=%.3f oosReturn=%.1f%% oosDD=%.1f%% testBars=%d regimes=%d(%s)",
+		req.StrategyType, res.CombosTested, best.ParamMsg, best.IsSharpe, res.OosSharpe, res.OosReturn, res.OosMaxDD, res.TestBars, len(regimeOOS), regimeSource)
 	return res, nil
+}
+
+// simpleRegimeLabel 把统一市场环境（sixdim.SimpleRegime）归一为中文「牛/熊/震荡」。
+func simpleRegimeLabel(r sixdim.SimpleRegime) string {
+	switch r {
+	case sixdim.SimpleBullish:
+		return "牛"
+	case sixdim.SimpleBearish:
+		return "熊"
+	default:
+		return "震荡"
+	}
+}
+
+// regimeLabelsForBars 为样本外每根K线打市场环境标签（牛/熊/震荡）。
+// 优先使用 market_sixdim_daily 的每日判势（统一口径 sixdim.ToSimpleRegime 归一，避免四套口径割裂）；
+// 六维历史覆盖不足（<50%）时回退用沪深300 trailing 20 日收益判定（真实指数数据）。
+// 返回标签切片与来源说明；两者都不可用时返回 nil。
+func regimeLabelsForBars(bars []tdx.KlineBar, dm *data.DuckDBManager) ([]string, string) {
+	if len(bars) == 0 || dm == nil || !dm.HasStockDB() {
+		return nil, ""
+	}
+	trimDate := func(d string) string {
+		if len(d) > 10 {
+			return d[:10]
+		}
+		return d
+	}
+	// 1) 六维判势（真实落库数据）
+	if rows, err := data.GetMarketSixDimRows(context.Background(), dm, 5000); err == nil && len(rows) > 0 {
+		byDate := make(map[string]string, len(rows))
+		for _, row := range rows {
+			byDate[trimDate(row.TradeDate)] = simpleRegimeLabel(sixdim.ToSimpleRegime(row.MarketTag, row.PositionRate))
+		}
+		labels := make([]string, len(bars))
+		hit := 0
+		for i, b := range bars {
+			if l, ok := byDate[trimDate(b.Date)]; ok {
+				labels[i] = l
+				hit++
+			} else {
+				labels[i] = "震荡" // 缺失按震荡处理，保守，不夸大牛/熊表现
+			}
+		}
+		if hit*2 >= len(bars) {
+			return labels, fmt.Sprintf("六维判势 market_sixdim_daily（覆盖 %d/%d 根）", hit, len(bars))
+		}
+	}
+	// 2) 回退：沪深300 trailing 20 日收益判定
+	bench := loadBenchmarkBars(dm, BenchmarkIndexCode, BenchmarkIndexName, len(bars)+30, "", "")
+	if len(bench) < benchmarkRegimeWindow+2 {
+		return nil, ""
+	}
+	closeByDate := make(map[string]float64, len(bench))
+	for _, b := range bench {
+		if b.Close > 0 {
+			closeByDate[b.Date] = b.Close
+		}
+	}
+	series := make([]float64, len(bars))
+	last := 0.0
+	for i, b := range bars {
+		if c, ok := closeByDate[trimDate(b.Date)]; ok && c > 0 {
+			last = c
+		}
+		series[i] = last
+	}
+	labels := make([]string, len(bars))
+	for i := range bars {
+		if i < benchmarkRegimeWindow || series[i] <= 0 || series[i-benchmarkRegimeWindow] <= 0 {
+			labels[i] = "震荡"
+			continue
+		}
+		r := series[i]/series[i-benchmarkRegimeWindow] - 1
+		switch {
+		case r > 0.03:
+			labels[i] = "牛"
+		case r < -0.03:
+			labels[i] = "熊"
+		default:
+			labels[i] = "震荡"
+		}
+	}
+	return labels, "沪深300 trailing 20 日收益判定（六维历史覆盖不足）"
+}
+
+// computeRegimeOOS 分市场环境（牛/熊/震荡）的样本外验证：
+// 把样本外K线按环境标签聚合为连续子区间，分别用被选中的最优参数回测，暴露"策略在弱市是否仍有效"。
+// 局限：同环境子区间在原时间轴上并不连续，拼接回测会在边界处存在跳空，仅用于横向比较各环境表现。
+func computeRegimeOOS(strategyType string, params map[string]float64, test []tdx.KlineBar, req *RunBacktestRequest, dm *data.DuckDBManager) ([]RegimeOOSResult, string) {
+	if len(test) < 20 {
+		return nil, ""
+	}
+	labels, source := regimeLabelsForBars(test, dm)
+	if labels == nil {
+		return nil, ""
+	}
+	var out []RegimeOOSResult
+	for start := 0; start < len(test); {
+		cur := labels[start]
+		end := start
+		for end+1 < len(test) && labels[end+1] == cur {
+			end++
+		}
+		if seg := test[start : end+1]; len(seg) >= 15 {
+			r := runComboOnSegment(strategyType, params, seg, req, dm)
+			out = append(out, RegimeOOSResult{
+				Regime: cur,
+				Bars:   len(seg),
+				Sharpe: r.SharpeRatio,
+				Return: r.AnnualReturn,
+				MaxDD:  r.MaxDrawdown,
+				Trades: r.TotalTrades,
+			})
+		}
+		start = end + 1
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	return out, source
 }
 
 // paramLabel 把一组参数渲染成人类可读、可复制的字符串（如 "快5/慢30"）。

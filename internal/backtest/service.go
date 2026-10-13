@@ -199,6 +199,8 @@ type BacktestResultDTO struct {
 	CostRatio       float64   `json:"cost_ratio"`
 	CostPerTrade    float64   `json:"cost_per_trade"`
 	CostCurve       []float64 `json:"cost_curve"`
+	// Benchmark 基准对比与分区间绩效（沪深300；基准数据缺失时为 nil）
+	Benchmark *BenchmarkMetrics `json:"benchmark,omitempty"`
 }
 
 // RunBacktestRequest 运行回测请求
@@ -254,6 +256,10 @@ func (s *Service) RunBacktest(req *RunBacktestRequest) (*BacktestResultDTO, erro
 
 	// 消除前视偏差（ExecNextOpen）、按标的自适应涨跌停、财务注入由 buildBacktestEngine 统一口径完成
 	engine := buildBacktestEngine(bars, strategy, req, s.duckdbMgr)
+	// 注入指数基准（沪深300，DuckDB 真实指数K线）：产出超额收益/Alpha/Beta 与分牛熊震荡区间绩效。
+	// 仅在单次回测注入（网格扫描每段都查库会放大开销）；基准缺失则结果为 nil，不影响回测。
+	engine.BenchmarkName = BenchmarkIndexName
+	engine.BenchmarkBars = loadBenchmarkBars(s.duckdbMgr, BenchmarkIndexCode, BenchmarkIndexName, len(bars)+30, req.StartDate, req.EndDate)
 	backtestResult := engine.Run()
 
 	// 构建结果
@@ -344,6 +350,8 @@ func (s *Service) RunBacktest(req *RunBacktestRequest) (*BacktestResultDTO, erro
 	dto.CostRatio = backtestResult.CostRatio
 	dto.CostPerTrade = backtestResult.CostPerTrade
 	dto.CostCurve = backtestResult.CostCurve
+	// 基准对比与分区间绩效（沪深300）
+	dto.Benchmark = backtestResult.Benchmark
 
 	return dto, nil
 }

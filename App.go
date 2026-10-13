@@ -439,6 +439,17 @@ func (a *App) startup(ctx context.Context) {
 			a.plannerAgent.SetStockMeta(brainhost.AdaptStockMeta(data.GetDictLoader()))
 			// 注入 LLM 审计元数据装饰（llmmonitoring）
 			a.plannerAgent.SetCallMetaDecorator(brainhost.AdaptCallMetaDecoratorLlmtrace())
+			// 注入六维判势市场环境提供者：选股市场状态缺失时，规划师据此做保守回退判断，
+			// 避免弱市现金保护静默失效（fail-open）。
+			if a.duckdbManager != nil {
+				a.plannerAgent.SetSixDimRegimeProvider(func() (string, float64, bool) {
+					rows, err := data.GetMarketSixDimRows(context.Background(), a.duckdbManager, 1)
+					if err != nil || len(rows) == 0 {
+						return "", 0, false
+					}
+					return rows[0].MarketTag, rows[0].PositionRate, true
+				})
+			}
 			// 方案持仓数与单支预算以组合实际可用资金为准（而非问卷画像资金），
 			// 确保「画像资本 vs 组合真实本金」不一致时方案贴合真实资金规模。
 			a.plannerAgent.SetCapitalProvider(func() float64 {

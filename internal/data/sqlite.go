@@ -1017,7 +1017,9 @@ type DailyReview struct {
 	// Quant复盘：是否调整策略的建议（JSON：建议与理由）
 	StrategyChangeSuggestion string `gorm:"type:text"`
 	// 各智能体复盘汇总（JSON：role->[{task,phase,deliverable,summary}]），由当日各Agent任务交付物聚合
-	AgentSummaries  string    `gorm:"type:text"`
+	AgentSummaries string `gorm:"type:text"`
+	// 指数基准归因（JSON）：相对沪深300的超额收益与 beta/选股 alpha 贡献拆分（真实日K数据）
+	Attribution     string    `gorm:"type:text"`
 	Summary         string    `gorm:"type:text"`
 	Recommendations string    `gorm:"type:text"`
 	Status          string    `gorm:"index;size:20;not null;default:COMPLETED"`

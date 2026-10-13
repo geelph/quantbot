@@ -66,6 +66,12 @@ type BacktestEngine struct {
 	// FinancialCoverage 财务数据覆盖率（0~1），Run 执行后填充，供日志/诊断
 	FinancialCoverage float64
 
+	// BenchmarkBars 可选的基准（指数）K线：注入后回测额外产出相对基准的超额/Alpha/Beta
+	// 与分市场环境（牛/熊/震荡）绩效。须与回测标的处于同一日期区间（真实数据，严禁伪造）。
+	BenchmarkBars []BarData
+	// BenchmarkName 基准名称（如「沪深300」），仅用于结果展示
+	BenchmarkName string
+
 	// volSeries 每根K线可用的日波动率 σ（trailing 窗口收益标准差），Run 前预计算（无前视偏差）
 	volSeries []float64
 }
@@ -269,6 +275,8 @@ type BacktestResult struct {
 	CostPerTrade    float64 `json:"costPerTrade"`    // 单笔平均成本（元）
 	// CostCurve 每日累计成本序列（元），与 Dates 对齐，用于成本吞噬收益的可视化
 	CostCurve []float64 `json:"costCurve"`
+	// Benchmark 基准对比与分区间绩效（需注入 BenchmarkBars；缺失时为 nil）
+	Benchmark *BenchmarkMetrics `json:"benchmark,omitempty"`
 }
 
 // 挂起的收盘买/卖信号（ExecNextOpen 模型下，于次日开盘执行）
@@ -740,8 +748,18 @@ func (e *BacktestEngine) calculatePerformance(st *backtestState, n int) *Backtes
 		CostCurve:       costCurve,
 	}
 
+	// 基准对比与分区间绩效（仅在调用方注入 BenchmarkBars 时产出）
+	if len(e.BenchmarkBars) > 0 {
+		result.Benchmark = computeBenchmarkMetrics(st.equityCurve, e.Dates, e.BenchmarkBars, e.BenchmarkName)
+	}
+
 	log.Printf("[BacktestEngine] Strategy=%s completed: annualReturn=%.2f%%, sharpe=%.4f, maxDD=%.2f%%, totalTrades=%d, winRate=%.2f%%, turnover=%.2fx",
 		e.Strategy.Name(), result.AnnualReturn, result.SharpeRatio, result.MaxDrawdown, result.TotalTrades, result.WinRate, result.Turnover)
+	if result.Benchmark != nil {
+		log.Printf("[BacktestEngine] Strategy=%s benchmark=%s: benchReturn=%.2f%%, excess=%.2f%%, alpha=%.2f%%, beta=%.2f, segments=%d",
+			e.Strategy.Name(), result.Benchmark.BenchmarkName, result.Benchmark.BenchmarkReturn*100,
+			result.Benchmark.ExcessReturn*100, result.Benchmark.Alpha*100, result.Benchmark.Beta, len(result.Benchmark.Segments))
+	}
 
 	return result
 }

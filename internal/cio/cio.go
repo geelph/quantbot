@@ -195,6 +195,93 @@ func (c *CIOEngine) addDrawdownAlert(dd, warn, stop float64, level string) {
 	})
 }
 
+// sixDimTargetExposure 由六维判势推导「目标权益敞口」（股票总市值/组合总资产）。
+// 以建议仓位系数 position_rate 为基准；当情绪（sentiment）或资金结构（capital）维度
+// 极端恶化时进一步收紧（只降不升），形成「快变量（情绪/北向资金）直连降仓」的传导通道，
+// 不必等到六维总分/标签整体转弱。返回 0~1。
+func sixDimTargetExposure(r *sixdim.MarketReport) float64 {
+	if r == nil {
+		return 0.3 // 六维不可用时的保守默认敞口
+	}
+	target := r.PositionRate
+	if target < 0 {
+		target = 0
+	}
+	if target > 1 {
+		target = 1
+	}
+	// 情绪极度冰点：直接收紧到 0.2
+	if v, ok := r.DimScores["sentiment"]; ok && v <= 25 && target > 0.2 {
+		target = 0.2
+	}
+	// 资金结构恶化（北向持续流出/无主线）：收紧到 0.3
+	if v, ok := r.DimScores["capital"]; ok && v <= 25 && target > 0.3 {
+		target = 0.3
+	}
+	return target
+}
+
+// sixDimDeleverageOrders 六维判势驱动的主动降仓（弱市减仓通道）。
+//
+// 修复「弱市只拦买、不降仓」的缺口：把 position_rate 视为「目标权益敞口」，
+// 当实际权益敞口显著高于目标时主动减仓：
+//   - 仅当当前敞口高于目标 5 个百分点以上才动作，避免频繁微调；
+//   - 单次最多收敛敞口差额的 50%（渐进降仓，不一次性砍到底）；
+//   - 只降不升，复用 generateSellOrders 的跌停封死/巨量打开盘口判定与整手取整，
+//     天然受 T+1 可用数量约束。
+//
+// 优先级：策略卖出 > 回撤熔断 > 六维降仓 > 建仓/加仓。
+func (c *CIOEngine) sixDimDeleverageOrders(positions []*portfolio.PositionState, totalAssets, targetExposure float64) []agents.OrderIntent {
+	if len(positions) == 0 || totalAssets <= 0 {
+		return nil
+	}
+	curMarket := 0.0
+	for _, pos := range positions {
+		if pos.Quantity > 0 && pos.CurrentPrice > 0 {
+			curMarket += float64(pos.Quantity) * pos.CurrentPrice
+		}
+	}
+	ratio := sixDimDeleverageReduceRatio(curMarket, totalAssets, targetExposure)
+	if ratio <= 0 {
+		return nil
+	}
+	return c.generateSellOrders(positions, ratio, "sixdim_deleverage")
+}
+
+// sixDimDeleverageReduceRatio 计算六维主动降仓的卖出比例（0 表示无需降仓）。纯函数，便于单测。
+//
+//	仅当当前权益敞口 > 目标敞口 + 5 个百分点才动作（避免频繁微调）；
+//	单次最多收敛敞口差额的一半（渐进降仓，不一次性砍到底）；返回 0~1。
+func sixDimDeleverageReduceRatio(curMarket, totalAssets, targetExposure float64) float64 {
+	if curMarket <= 0 || totalAssets <= 0 {
+		return 0
+	}
+	if targetExposure < 0 {
+		targetExposure = 0
+	}
+	if targetExposure > 1 {
+		targetExposure = 1
+	}
+	curExposure := curMarket / totalAssets
+	if curExposure <= targetExposure+0.05 {
+		return 0
+	}
+	// 单次只收敛敞口差额的一半（渐进降仓）
+	stepExposure := curExposure - (curExposure-targetExposure)*0.5
+	if stepExposure < targetExposure {
+		stepExposure = targetExposure
+	}
+	targetMarket := totalAssets * stepExposure
+	ratio := (curMarket - targetMarket) / curMarket
+	if ratio <= 0 {
+		return 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	return ratio
+}
+
 type CIOEngine struct {
 	agent                *cioAgent
 	db                   *data.SQLiteManager
@@ -231,6 +318,56 @@ type CIOEngine struct {
 	// 先成交一个切片（≤maxSliceShares），剩余量入队，随后续监控周期分批成交，降低市场冲击。
 	splitMu       sync.Mutex
 	pendingSplits []pendingSplitOrder
+
+	// deleverageMu / lastDeleverageAt 六维主动降仓节流：两次降仓至少间隔 30 分钟，
+	// 避免执行回报尚未回填时在同一敞口状态下重复下单，同时允许市场持续恶化时分档加码。
+	deleverageMu     sync.Mutex
+	lastDeleverageAt time.Time
+
+	// 统一止损阈值源缓存：弱市判定结果缓存 5 分钟，避免每只持仓/每次止损检查重复查库。
+	sixdimCacheMu      sync.Mutex
+	sixdimCacheAt      time.Time
+	sixdimCacheBearish bool
+}
+
+// effectiveStopLossPct 统一止损阈值源：基准 5%，弱市（六维判势标签「偏弱/退潮」或仓位系数≤0.2）
+// 收紧到 3.5%。供 ATR 止损、盘中止损执行与风险监控共用同一阈值口径，避免各处阈值割裂。
+func (c *CIOEngine) effectiveStopLossPct() float64 {
+	const base, weak = 0.05, 0.035
+	if c.marketRegimeBearish() {
+		return weak
+	}
+	return base
+}
+
+// marketRegimeBearish 读取最近一次落库的六维判势结果判定是否弱市（优先持久化数据，
+// 避免在止损检查这类高频路径上重跑完整六维 Fetcher）。结果缓存 5 分钟。
+func (c *CIOEngine) marketRegimeBearish() bool {
+	c.sixdimCacheMu.Lock()
+	defer c.sixdimCacheMu.Unlock()
+	if !c.sixdimCacheAt.IsZero() && time.Since(c.sixdimCacheAt) < 5*time.Minute {
+		return c.sixdimCacheBearish
+	}
+	bearish := false
+	if c.duckDB != nil && c.duckDB.HasStockDB() {
+		if rows, err := data.GetMarketSixDimRows(context.Background(), c.duckDB, 1); err == nil && len(rows) > 0 {
+			bearish = sixdim.ToSimpleRegime(rows[0].MarketTag, rows[0].PositionRate) == sixdim.SimpleBearish
+		}
+	}
+	c.sixdimCacheBearish = bearish
+	c.sixdimCacheAt = time.Now()
+	return bearish
+}
+
+// sixDimDeleverageAllowed 六维主动降仓节流：两次降仓至少间隔 30 分钟（首次放行）。
+func (c *CIOEngine) sixDimDeleverageAllowed() bool {
+	c.deleverageMu.Lock()
+	defer c.deleverageMu.Unlock()
+	if !c.lastDeleverageAt.IsZero() && time.Since(c.lastDeleverageAt) < 30*time.Minute {
+		return false
+	}
+	c.lastDeleverageAt = time.Now()
+	return true
 }
 
 // pendingSplitOrder 大额买入拆单后待成交的剩余切片。
@@ -1204,6 +1341,22 @@ func (c *CIOEngine) makeDecision(ctx context.Context, quantReport *ResearchRepor
 		}
 	}
 
+	// —— 六维判势主动降仓（弱市减仓通道）——
+	// 修复「弱市只拦买不降仓」的缺口：把 position_rate 作为目标权益敞口，
+	// 当实际权益敞口显著高于目标时主动减仓（只降不升，不突破风控门与 T+1 约束）。
+	// 优先级：策略卖出 > 回撤熔断 > 六维降仓 > 建仓/加仓。
+	if len(orders) == 0 && ddLevel != "stop" && sixDim != nil && c.portfolio != nil {
+		totalAssets := snapshot.Cash + snapshot.TotalMarketValue
+		deleverage := c.sixDimDeleverageOrders(snapshot.Positions, totalAssets, sixDimTargetExposure(sixDim))
+		if len(deleverage) > 0 && c.sixDimDeleverageAllowed() {
+			orders = deleverage
+			decision.Decision = agents.DecisionReduce
+			decision.Reason = fmt.Sprintf("六维判势「%s」(仓位系数%.2f)显示权益敞口偏高，主动降仓降低风险", sixDim.MarketTag, sixDim.PositionRate)
+			c.addActivity("CIO", "SIXDIM_DELEVERAGE", decision.Reason, decision.SixDim)
+			log.Printf("[CIO] 六维主动降仓: 标签=%s 仓位系数=%.2f 减仓%d只", sixDim.MarketTag, sixDim.PositionRate, len(deleverage))
+		}
+	}
+
 	// —— 持仓数收敛到目标（投资金额分档改制后，如 20 万以内最多 5 只）——
 	// 策略卖出、回撤熔断优先；仅在无更高优先级动作且持仓数超出目标时，清算多余持仓收敛到 target。
 	if len(orders) == 0 && ddLevel == "" && targetPositionCount > 0 && positionCount > targetPositionCount {
@@ -1236,20 +1389,42 @@ func (c *CIOEngine) makeDecision(ctx context.Context, quantReport *ResearchRepor
 				}
 			}
 		case "BEARISH":
-			if positionCount > 0 && snapshot.TotalReturn > 0.05 {
-				orders = c.generateSellOrders(snapshot.Positions, 0.5, "bearish")
-				decision.Decision = agents.DecisionReduce
-				decision.Reason = fmt.Sprintf("市场处于熊市状态(置信度%.0f%%)，建议减仓锁定利润", confidence*100)
-			} else if positionCount > 0 && snapshot.TotalReturn < -0.08 {
-				orders = c.generateSellOrders(snapshot.Positions, 0.3, "stop_loss")
-				decision.Decision = agents.DecisionReduce
-				decision.Reason = "持仓已触发止损线，建议减仓控制损失"
-			} else if ddLevel == "" && !buildBlocked && availableCash > 20000 {
+			// 弱市分层降仓（修复原逻辑「条件反了」：仅累计收益>5%才减仓，
+			// 而回撤 -8%~+5% 区间反而买防御股）：
+			// 按组合累计收益（回撤深度）分档 + 六维仓位系数共同决定减仓比例，深度越深减得越多；
+			// 仅当风险已充分释放（六维 position_rate ≥ 0.4）且无更高优先级动作时，才允许小幅配置防御股，
+			// 绝不逆势加仓。
+			targetExposure := sixDimTargetExposure(sixDim)
+			sellRatio := 0.0
+			switch {
+			case snapshot.TotalReturn <= -0.12:
+				sellRatio = 0.30
+			case snapshot.TotalReturn <= -0.08:
+				sellRatio = 0.20
+			case snapshot.TotalReturn <= -0.05:
+				sellRatio = 0.10
+			}
+			// 六维偏弱且组合浮亏：至少减一档（快变量传导）
+			if sellRatio == 0 && targetExposure < 0.3 && snapshot.TotalReturn < 0 {
+				sellRatio = 0.10
+			}
+			if positionCount > 0 && sellRatio > 0 {
+				orders = c.generateSellOrders(snapshot.Positions, sellRatio, "bearish")
+				if len(orders) > 0 {
+					decision.Decision = agents.DecisionReduce
+					decision.Reason = fmt.Sprintf("市场处于熊市状态(置信度%.0f%%)，组合累计收益%.1f%%，按回撤深度分档减仓%.0f%%",
+						confidence*100, snapshot.TotalReturn*100, sellRatio*100)
+				}
+			}
+			// 仅在弱市风险已释放（六维仓位系数≥0.4）时配置防御性板块，避免逆势加仓
+			if len(orders) == 0 && ddLevel == "" && !buildBlocked && sixDim != nil && sixDim.PositionRate >= 0.4 && availableCash > 20000 {
 				defensiveStocks := c.filterDefensiveStocks(topStocks)
 				if len(defensiveStocks) > 0 {
 					orders = c.generateBuyOrdersFromFactors(defensiveStocks, availableCash, portfolioValue, "defensive", signalSource)
-					decision.Decision = agents.DecisionBuild
-					decision.Reason = "市场熊市，配置防御性板块"
+					if len(orders) > 0 {
+						decision.Decision = agents.DecisionBuild
+						decision.Reason = "市场熊市但六维仓位系数回升，小幅配置防御性板块"
+					}
 				}
 			}
 		default:
@@ -2180,6 +2355,108 @@ func sortIndustryByWeight(list []map[string]interface{}) []map[string]interface{
 	return list
 }
 
+// computeIndexAttribution 以沪深300为基准的组合归因：把组合区间超额收益拆分为
+// 「市场 beta 贡献」与「选股 alpha 贡献」，全部基于 DuckDB 真实日K（严禁伪造）。
+//
+//	excess          = portfolioReturn - indexReturn
+//	betaContribution = (beta - 1) * indexReturn     // 承担市场风险带来的超额/拖累
+//	alphaContribution = excess - betaContribution   // 选股/择时的独立贡献
+//
+// portfolioReturns 为组合日收益序列（由 computePositionReturns 提供）；数据不足返回 nil。
+func (c *CIOEngine) computeIndexAttribution(portfolioReturns []float64) map[string]interface{} {
+	if c.duckDB == nil || len(portfolioReturns) < 2 {
+		return nil
+	}
+	ctx := context.Background()
+	bars, err := c.duckDB.GetKlineFromStock(ctx, data.ToMarketCode("sh000300"), len(portfolioReturns)+5)
+	if err != nil || len(bars) < 3 {
+		return nil
+	}
+	// bars 按日期 DESC，反转成升序收盘价
+	closes := make([]float64, 0, len(bars))
+	for i := len(bars) - 1; i >= 0; i-- {
+		if bars[i].Close > 0 {
+			closes = append(closes, bars[i].Close)
+		}
+	}
+	if len(closes) < 3 {
+		return nil
+	}
+	indexRet := make([]float64, 0, len(closes)-1)
+	for i := 1; i < len(closes); i++ {
+		indexRet = append(indexRet, closes[i]/closes[i-1]-1)
+	}
+
+	// 按尾部对齐两个收益序列
+	n, m := len(portfolioReturns), len(indexRet)
+	k := n
+	if m < k {
+		k = m
+	}
+	if k < 2 {
+		return nil
+	}
+	pRet := portfolioReturns[n-k:]
+	iRet := indexRet[m-k:]
+
+	var mp, mi float64
+	for j := 0; j < k; j++ {
+		mp += pRet[j]
+		mi += iRet[j]
+	}
+	mp /= float64(k)
+	mi /= float64(k)
+	var cov, varI float64
+	for j := 0; j < k; j++ {
+		cov += (pRet[j] - mp) * (iRet[j] - mi)
+		varI += (iRet[j] - mi) * (iRet[j] - mi)
+	}
+	beta := 0.0
+	if varI > 1e-15 {
+		beta = cov / varI
+	}
+
+	portTotal, idxTotal := 1.0, 1.0
+	for j := 0; j < k; j++ {
+		portTotal *= 1 + pRet[j]
+		idxTotal *= 1 + iRet[j]
+	}
+	portReturn := portTotal - 1
+	indexReturn := idxTotal - 1
+	excess := portReturn - indexReturn
+	betaContrib := (beta - 1) * indexReturn
+	alphaContrib := excess - betaContrib
+
+	return map[string]interface{}{
+		"benchmark_name":     "沪深300",
+		"benchmark_return":   round4(indexReturn * 100),
+		"portfolio_return":   round4(portReturn * 100),
+		"excess_return":      round4(excess * 100),
+		"beta":               round4(beta),
+		"beta_contribution":  round4(betaContrib * 100),
+		"alpha_contribution": round4(alphaContrib * 100),
+		"window_days":        k,
+	}
+}
+
+// indexIntervalReturn 取沪深300最近 lookback 个交易日的真实区间累计收益率（=最新收盘/最早收盘-1）。
+func (c *CIOEngine) indexIntervalReturn(lookback int) (float64, bool) {
+	if c.duckDB == nil || lookback < 2 {
+		return 0, false
+	}
+	bars, err := c.duckDB.GetKlineFromStock(context.Background(), data.ToMarketCode("sh000300"), lookback)
+	if err != nil || len(bars) < 2 {
+		return 0, false
+	}
+	// bars 按日期 DESC：最新在前，最早在后
+	last := bars[0].Close
+	first := bars[len(bars)-1].Close
+	if first <= 0 {
+		return 0, false
+	}
+	return last/first - 1, true
+}
+
 // computeBrinson 行业级 Brinson 归因：组合 vs 等权基准，区间收益取自 DuckDB 真实日K线。
 // 若区间收益数据不足则返回空结构（严禁伪造）。
 func (c *CIOEngine) computeBrinson(weights map[string]float64, stocks []factors.StockFactors, industryOf map[string]string) map[string]interface{} {
@@ -2218,14 +2495,28 @@ func (c *CIOEngine) computeBrinson(weights map[string]float64, stocks []factors.
 		return industries[i]["industry"].(string) < industries[j]["industry"].(string)
 	})
 
+	// 基准由「等权候选池」改为「沪深300指数」：超额收益 = 组合区间收益 - 指数区间收益（真实日K）。
+	// 指数数据不可用时回退等权候选池，并如实标注基准名称，避免误导。
+	benchmarkName := "沪深300"
+	benchmarkReturn := attribution.BenchmarkReturn
+	if ir, ok := c.indexIntervalReturn(20); ok {
+		benchmarkReturn = ir
+	} else {
+		benchmarkName = "等权候选池"
+	}
+	excess := attribution.PortfolioReturn - benchmarkReturn
+
 	return map[string]interface{}{
-		"benchmark_return": round4(attribution.BenchmarkReturn * 100),
-		"portfolio_return": round4(attribution.PortfolioReturn * 100),
-		"excess_return":    round4(attribution.ExcessReturn * 100),
-		"allocation":       round4(attribution.Allocation * 100),
-		"selection":        round4(attribution.Selection * 100),
-		"interaction":      round4(attribution.Interaction * 100),
-		"industries":       industries,
+		"benchmark_name":     benchmarkName,
+		"benchmark_return":   round4(benchmarkReturn * 100),
+		"portfolio_return":   round4(attribution.PortfolioReturn * 100),
+		"excess_return":      round4(excess * 100),
+		"pool_excess_return": round4(attribution.ExcessReturn * 100),
+		"industry_benchmark": "等权候选池",
+		"allocation":         round4(attribution.Allocation * 100),
+		"selection":          round4(attribution.Selection * 100),
+		"interaction":        round4(attribution.Interaction * 100),
+		"industries":         industries,
 	}
 }
 
@@ -2415,6 +2706,10 @@ func (c *CIOEngine) detectMarketRegime() string {
 // checkPositionStopLoss 检查单个持仓的止损状态（使用ATR动态止损）
 func (c *CIOEngine) checkPositionStopLoss(pos *portfolio.PositionState) risk.RiskAlert {
 	stopConfig := risk.DefaultStopLossConfig()
+	// 统一止损阈值源：弱市自动收紧（5% → 3.5%），供 ATR 止损与盘中止损执行共用同一口径。
+	baseStop := c.effectiveStopLossPct()
+	stopConfig.InitialStop = baseStop
+	weakMarket := baseStop < 0.05
 
 	history := c.buildPriceHistoryFromPositions(pos.InstrumentID)
 	if len(history) >= 5 {
@@ -2427,6 +2722,10 @@ func (c *CIOEngine) checkPositionStopLoss(pos *portfolio.PositionState) risk.Ris
 			}
 			if atrStop < 0.03 {
 				atrStop = 0.03
+			}
+			// 弱市收紧：ATR 止损不得宽于统一阈值，避免高波动个股在弱市被给予过宽容错。
+			if weakMarket && atrStop > baseStop {
+				atrStop = baseStop
 			}
 			stopConfig.InitialStop = atrStop
 		}
@@ -3937,6 +4236,48 @@ func (c *CIOEngine) MonitorIntradayInvestmentPlan(ctx context.Context) error {
 			marketWeak = true
 			c.addActivity("CIO", "SIXDIM_ALERT",
 				fmt.Sprintf("六维判势告警：市场标签「%s」，仓位系数%.2f，建议降低风险敞口、暂缓建仓", sixDim.MarketTag, sixDim.PositionRate), sixdimPayload)
+		}
+	}
+
+	// —— 六维判势盘中主动降仓（弱市减仓通道）——
+	// 修复「盘中六维转弱仅告警、直接 return nil 不降仓」的缺口：
+	// 六维归一为弱势（BEARISH）或盘中实时明显走弱时，若实际权益敞口显著高于
+	// 目标（position_rate 或情绪/资金恶化后收紧的目标），主动减仓（只降不升）。
+	// 优先级：策略卖出 > 回撤熔断 > 六维降仓 > 建仓/加仓。
+	sixdimBearish := sixDim != nil && sixdim.ToSimpleRegime(sixDim.MarketTag, sixDim.PositionRate) == sixdim.SimpleBearish
+	if (sixdimBearish || marketWeak) && c.portfolio != nil {
+		totalAssets := snapshot.Cash + snapshot.TotalMarketValue
+		targetExposure := sixDimTargetExposure(sixDim)
+		deleverage := c.sixDimDeleverageOrders(snapshot.Positions, totalAssets, targetExposure)
+		if len(deleverage) > 0 && c.sixDimDeleverageAllowed() {
+			tag := "实时走弱"
+			rate := targetExposure
+			if sixDim != nil {
+				tag = sixDim.MarketTag
+				rate = sixDim.PositionRate
+			}
+			reason := fmt.Sprintf("盘中市场走弱(标签「%s」仓位系数%.2f、指数均涨跌%.2f%%)，实际权益敞口偏高，主动降仓控制风险",
+				tag, rate, marketAvgPct)
+			decision := &agents.CIODecision{
+				DecisionID:       c.generateDecisionID(),
+				PortfolioID:      "P001",
+				Decision:         agents.DecisionReduce,
+				Reason:           reason,
+				Orders:           deleverage,
+				RiskApproval:     string(riskApprove),
+				PolicyStatus:     "PENDING",
+				MarketState:      marketRegime,
+				MarketConfidence: marketAvgPct,
+				Timestamp:        time.Now(),
+				SixDim:           sixdimPayload,
+			}
+			c.saveDecision(decision)
+			c.addActivity("CIO", "SIXDIM_DELEVERAGE", "[CIO] 决策: REDUCE（六维判势主动降仓）", map[string]interface{}{
+				"decision": decision.Decision, "reason": reason, "orders": deleverage, "sixdim": sixdimPayload,
+			})
+			c.executeDecision(ctx, decision)
+			c.agent.SetState(agents.StateIdle)
+			return nil
 		}
 	}
 
@@ -5679,6 +6020,7 @@ func (c *CIOEngine) GenerateDailyReview(ctx context.Context) (*data.DailyReview,
 	var marketRegime string
 	var marketConfidence float64
 	var topGainers, topLosers, riskMetrics, keyEvents, decisionsJSON string
+	var attributionJSON string
 	var positionStrategyReview, strategyChangeSuggestion string
 	var summary, recommendations string
 
@@ -5866,6 +6208,10 @@ func (c *CIOEngine) GenerateDailyReview(ctx context.Context) (*data.DailyReview,
 					"positions_count": positionsCount,
 				}
 			}
+			// 指数基准归因：相对沪深300的超额收益与 beta/选股 alpha 贡献拆分（真实日K）
+			if attr := c.computeIndexAttribution(returns); attr != nil {
+				attributionJSON = safeMarshal(attr, "{}")
+			}
 		}
 		if riskMetricsData == nil {
 			riskMetricsData = map[string]interface{}{
@@ -5971,6 +6317,7 @@ func (c *CIOEngine) GenerateDailyReview(ctx context.Context) (*data.DailyReview,
 		PositionStrategyReview:   positionStrategyReview,
 		StrategyChangeSuggestion: strategyChangeSuggestion,
 		AgentSummaries:           agentSummaries,
+		Attribution:              attributionJSON,
 		Summary:                  summary,
 		Recommendations:          recommendations,
 		Status:                   "COMPLETED",
@@ -6078,6 +6425,7 @@ func (c *CIOEngine) GetDailyReviews(days int) ([]map[string]interface{}, error) 
 			"position_strategy_review":   r.PositionStrategyReview,
 			"strategy_change_suggestion": r.StrategyChangeSuggestion,
 			"agent_summaries":            r.AgentSummaries,
+			"attribution":                r.Attribution,
 			"summary":                    r.Summary,
 			"recommendations":            r.Recommendations,
 			"status":                     r.Status,
