@@ -1269,11 +1269,34 @@ func (dm *DuckDBManager) BatchGetFactorBars(ctx context.Context, symbols []strin
 		}
 		bar.Turnover = bar.Amount
 
-		result[bar.Symbol] = append(result[bar.Symbol], bar)
+		// 每只 symbol 取最近 `days` 根（date DESC 已排好序，超过的截断）。
+		// 对应 AlphaLom EAV 优化的"最近 K 个交易日"回溯窗口：
+		//   AlphaLom 是 MySQL 长表，需要先求"最近有数据的交易日"再用等值条件命中索引；
+		//   QuantBot 用 DuckDB 列存范围查询已经高效，但裁剪冗余行数能降低后续因子计算的开销。
+		cur := result[bar.Symbol]
+		if len(cur) >= days {
+			continue // 已够最近 N 天，跳过旧行
+		}
+		result[bar.Symbol] = append(cur, bar)
 		rowCount++
 	}
 
-	log.Printf("[BatchGetFactorBars] 查询完成: %d 行数据, %d 只股票有数据", rowCount, len(result))
+	// 日志：每只 symbol 实际取到的 bar 数分布（帮助诊断因子覆盖度）
+	minBars, maxBars, underExpected := 9999, 0, 0
+	for _, v := range result {
+		n := len(v)
+		if n < minBars {
+			minBars = n
+		}
+		if n > maxBars {
+			maxBars = n
+		}
+		if n < days*3/4 {
+			underExpected++
+		}
+	}
+	log.Printf("[BatchGetFactorBars] 查询完成: %d 行数据, %d 只股票有数据, bars=[%d,%d], 不足%d条的有%d只",
+		rowCount, len(result), minBars, maxBars, days*3/4, underExpected)
 
 	if len(result) == 0 {
 		return nil, fmt.Errorf("批量查询因子数据返回空结果 (%d 只股票, 起始日期 %s)", len(symbols), startDate)

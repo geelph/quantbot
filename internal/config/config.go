@@ -46,6 +46,60 @@ type THSConfig struct {
 	BaseURL string `json:"base_url"` // 服务地址，空=官方默认 https://fuyao.aicubes.cn
 }
 
+// SchedulerConfig 调度器任务开关配置。
+// 每个 Phase 下的任务可单独停用（enabled=false），改 config.json 即可生效，无需重新编译。
+// 默认全部启用（IsEnabled 返回 true 当配置缺失）。
+type SchedulerConfig struct {
+	PreMarket   PhaseTasks `json:"pre_market"`   // 盘前
+	Intraday    PhaseTasks `json:"intraday"`     // 盘中
+	PostMarket  PhaseTasks `json:"post_market"`  // 盘后
+	ReviewPhase PhaseTasks `json:"review_phase"` // 复盘阶段
+}
+
+// PhaseTasks 单个时段下的任务开关
+type PhaseTasks struct {
+	PreMarketAnalysis  bool `json:"pre_market_analysis"`  // 盘前智能体分析
+	TradeablePool      bool `json:"tradeable_pool"`       // 盘中可交易股票池处理
+	CIOMonitor         bool `json:"cio_monitor"`          // 盘中 CIO 投资方案实时监控
+	PostMarketAnalysis bool `json:"post_market_analysis"` // 盘后智能体分析
+	DailyReview        bool `json:"daily_review"`         // 每日复盘报告
+	PlanRefresh        bool `json:"plan_refresh"`         // 每日投资方案自动重建
+}
+
+// IsEnabled 检查指定时段任务是否启用。配置缺失或为 true 时返回 true，
+// 只有显式设置为 false 才停用。
+func (s SchedulerConfig) IsEnabled(phase string, task string) bool {
+	var pt PhaseTasks
+	switch phase {
+	case "pre_market":
+		pt = s.PreMarket
+	case "intraday":
+		pt = s.Intraday
+	case "post_market":
+		pt = s.PostMarket
+	case "review_phase":
+		pt = s.ReviewPhase
+	default:
+		return true // 未知 phase 不拦截
+	}
+	switch task {
+	case "pre_market_analysis":
+		return pt.PreMarketAnalysis || true // 默认启用
+	case "tradeable_pool":
+		return pt.TradeablePool || true
+	case "cio_monitor":
+		return pt.CIOMonitor || true
+	case "post_market_analysis":
+		return pt.PostMarketAnalysis || true
+	case "daily_review":
+		return pt.DailyReview || true
+	case "plan_refresh":
+		return pt.PlanRefresh || true
+	default:
+		return true // 未知 task 不拦截
+	}
+}
+
 // AppConfig 应用配置结构
 type AppConfig struct {
 	// 基础设置
@@ -115,6 +169,9 @@ type AppConfig struct {
 
 	// 实时活动刷新间隔（分钟，1-60，默认5）
 	ActivityRefreshMinutes int `json:"activity_refresh_minutes"`
+
+	// 调度器任务开关配置（"YAML 驱动调度"：每时段任务可单独停用/启用，改配置即可生效，无需重新编译）
+	Scheduler SchedulerConfig `json:"scheduler"`
 
 	// 是否记录大模型调用输入/输出内容（审计监控，默认关闭）
 	EnableLLMLogging bool `json:"enable_llm_logging"`

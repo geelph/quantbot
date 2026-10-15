@@ -422,6 +422,14 @@ func (s *AutoScheduler) TriggerPhaseAction(phase util.MarketPhase) {
 
 // runPreMarketAnalysis 盘前分析
 func (s *AutoScheduler) runPreMarketAnalysis() {
+	// P1 YAML 驱动调度：任务开关检查。显式 disabled 时跳过，配置缺失时默认启用。
+	if s.harness != nil {
+		cfg := s.harness.GetConfig()
+		if !cfg.Scheduler.IsEnabled("pre_market", "pre_market_analysis") {
+			log.Println("[AutoScheduler] 盘前智能体分析已在 scheduler 配置中停用，跳过")
+			return
+		}
+	}
 	if s.cycleRunning {
 		log.Println("[AutoScheduler] 分析周期正在运行中，跳过盘前分析")
 		return
@@ -499,6 +507,13 @@ func (s *AutoScheduler) logIntradayStart() {
 
 // processTradeablePool 处理可交易股票池
 func (s *AutoScheduler) processTradeablePool() {
+	// P1 YAML 驱动调度：任务开关检查
+	if s.harness != nil {
+		cfg := s.harness.GetConfig()
+		if !cfg.Scheduler.IsEnabled("intraday", "tradeable_pool") {
+			return
+		}
+	}
 	s.mu.Lock()
 	now := time.Now()
 	// 检查是否需要处理（避免过于频繁）
@@ -541,6 +556,13 @@ func (s *AutoScheduler) processTradeablePool() {
 
 // processCIOIntradayPlanMonitor 盘中定期执行 CIO 投资方案实时监控与决策
 func (s *AutoScheduler) processCIOIntradayPlanMonitor() {
+	// P1 YAML 驱动调度：任务开关检查
+	if s.harness != nil {
+		cfg := s.harness.GetConfig()
+		if !cfg.Scheduler.IsEnabled("intraday", "cio_monitor") {
+			return
+		}
+	}
 	s.mu.Lock()
 	now := time.Now()
 	// 检查是否需要处理（避免过于频繁）
@@ -673,6 +695,14 @@ func (s *AutoScheduler) logIntradayEnd() {
 
 // runPostMarketAnalysis 盘后分析
 func (s *AutoScheduler) runPostMarketAnalysis() {
+	// P1 YAML 驱动调度：任务开关检查
+	if s.harness != nil {
+		cfg := s.harness.GetConfig()
+		if !cfg.Scheduler.IsEnabled("post_market", "post_market_analysis") {
+			log.Println("[AutoScheduler] 盘后智能体分析已在 scheduler 配置中停用，跳过")
+			return
+		}
+	}
 	if s.cycleRunning {
 		log.Println("[AutoScheduler] 分析周期正在运行中，跳过盘后分析")
 		return
@@ -767,6 +797,14 @@ func (s *AutoScheduler) runDailySettlement() {
 
 // generateDailyReview 生成每日复盘报告
 func (s *AutoScheduler) generateDailyReview() {
+	// P1 YAML 驱动调度：任务开关检查
+	if s.harness != nil {
+		cfg := s.harness.GetConfig()
+		if !cfg.Scheduler.IsEnabled("review_phase", "daily_review") {
+			log.Println("[AutoScheduler] 每日复盘已在 scheduler 配置中停用，跳过")
+			return
+		}
+	}
 	s.mu.RLock()
 	processor := s.dailyReviewProcessor
 	lastDate := s.lastDailyReviewDate
@@ -833,6 +871,14 @@ func (s *AutoScheduler) generateDailyReview() {
 // rebuildInvestmentPlanDay 每日自动重建投资方案股票池（幂等：同一交易日仅执行一次）。
 // 在复盘阶段调用，用最新全市场真实因子数据重建当前方案的选股与持仓并落库。
 func (s *AutoScheduler) rebuildInvestmentPlanDay() {
+	// P1 YAML 驱动调度：任务开关检查
+	if s.harness != nil {
+		cfg := s.harness.GetConfig()
+		if !cfg.Scheduler.IsEnabled("review_phase", "plan_refresh") {
+			log.Println("[AutoScheduler] 每日投资方案重建已在 scheduler 配置中停用，跳过")
+			return
+		}
+	}
 	s.mu.RLock()
 	processor := s.planRefreshProcessor
 	lastDate := s.lastPlanRefreshDate

@@ -193,13 +193,23 @@ type decisionProposalPayload struct {
 	GeneratedAt string   `json:"generated_at"`
 }
 
-// genDecisionProposal 采集证据 → 调用 LLM 生成决策主张。
+// genDecisionProposal 采集证据 → 两阶段调用 LLM 生成决策主张。
+//
+//	Phase A（前置调研）：让 LLM 先输出一段自然语言的市场研判要点，作为后续 JSON 决策的"先验判断"；
+//	  此阶段失败/超时/无输出时静默降级（preResearch 返回空串），不阻断 Phase B。
+//	Phase B（严格 JSON 决策）：沿用原单轮 JSON 生成，把 Phase A 的研判拼到 prompt 最前面，
+//	  降低 LLM "在没做研判的情况下直接编一个 JSON" 的风险。
+//
 // 返回 nil 表示不可用/失败（调用方应完全回退规则，不作任何变更）。
 func (c *CIOEngine) genDecisionProposal(ctx context.Context, proposalInput proposalInput) *llmDecisionProposal {
 	if c.agent == nil || c.agent.LLM == nil {
 		return nil
 	}
-	prompt := buildProposalPrompt(proposalInput)
+	// Phase A: 前置调研（自然语言研判）
+	preResearch := c.runPreliminaryAssessment(ctx, proposalInput)
+	prompt := buildProposalPrompt(proposalInput, preResearch)
+
+	// Phase B: 严格 JSON 决策
 	ctx2, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
@@ -215,17 +225,77 @@ func (c *CIOEngine) genDecisionProposal(ctx context.Context, proposalInput propo
 		log.Printf("[CIO] 决策主张跳过(无输出)")
 		return nil
 	}
-	prop := c.parseDecisionProposal(resp.Choices[0].Message.Content)
+	content := resp.Choices[0].Message.Content
+	// P2 后处理：先 extractJSONBlock 截取（容忍 LLM 在 JSON 前输出自然语言总结），
+	// 再 sanitizeDecisionProposal 做 clamp/去重/纯代码提取。
+	prop := c.parseDecisionProposal(content)
 	if prop == nil {
-		log.Printf("[CIO] 决策主张跳过(输出无法解析): %s", truncateStr(resp.Choices[0].Message.Content, 120))
+		log.Printf("[CIO] 决策主张跳过(输出无法解析): %s", truncateStr(content, 120))
 		return nil
 	}
-	if prop.TargetPositionRate <= 0 {
-		prop.TargetPositionRate = 1.0 // 未给出仓位主张时默认不干预
-	}
-	log.Printf("[CIO] 决策主张: 方向=%s 建议仓位=%.2f 偏好%d只 置信度=%d",
-		prop.MarketDirection, prop.TargetPositionRate, len(prop.PreferredStocks), prop.Confidence)
+	prop = c.sanitizeDecisionProposal(prop)
+	log.Printf("[CIO] 决策主张: 方向=%s 建议仓位=%.2f 偏好%d只 置信度=%d 前置调研=%v",
+		prop.MarketDirection, prop.TargetPositionRate, len(prop.PreferredStocks), prop.Confidence, preResearch != "")
 	return prop
+}
+
+// preResearchSystemPrompt Phase A 前置调研的系统提示词：
+// 让 LLM 先自由地"看看证据、想想市场"，输出一段 80~120 字的研判要点（非 JSON）。
+// 关键设计：不要求任何结构化输出，让模型在自然语言层面先形成判断，
+// 再在 Phase B 里把这段判断拼到 JSON prompt 最前面，让 JSON 有了"判断来源"，
+// 避免 LLM 在 response_format=json_object 的约束下"直接编一个 JSON 而完全不看证据"。
+const preResearchSystemPrompt = `你是A股量化基金的首席研判员。系统会注入今天的真实市场证据。
+请先看一遍这些证据，然后用 80~120 字自由地写出你的市场研判要点：
+- 你认为今天市场方向如何（偏多/偏空/震荡）？
+- 有没有什么关键的风险或机会点值得决策层注意？
+- 哪些证据对你的判断最有分量？
+
+请用自然语言写，不需要结构化，不需要 JSON，不需要输出其他内容。`
+
+// runPreliminaryAssessment Phase A 前置调研调用。
+// 失败/超时/无输出 → 返回空串（静默降级，不阻断 Phase B）。
+func (c *CIOEngine) runPreliminaryAssessment(ctx context.Context, in proposalInput) string {
+	if c.agent == nil || c.agent.LLM == nil {
+		return ""
+	}
+	prompt := buildPreResearchPrompt(in)
+	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second) // Phase A 超时更短（30s vs 60s）
+	defer cancel()
+	resp, err := c.agent.LLM.Chat(ctx2, []agents.Message{
+		{Role: "system", Content: preResearchSystemPrompt},
+		{Role: "user", Content: prompt},
+	}, nil)
+	if err != nil {
+		log.Printf("[CIO] 前置调研跳过(调用失败): %v", err)
+		return ""
+	}
+	if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
+		log.Printf("[CIO] 前置调研跳过(无输出)")
+		return ""
+	}
+	text := strings.TrimSpace(resp.Choices[0].Message.Content)
+	// 截断到 200 字以内（防止 LLM 写太长挤占 JSON prompt 空间）
+	if len(text) > 600 {
+		text = text[:600] + "…"
+	}
+	log.Printf("[CIO] 前置调研(%d字): %s", len(text), truncateStr(text, 120))
+	return text
+}
+
+// buildPreResearchPrompt Phase A 的证据拼装（比 Phase B 更精简，只列核心证据）。
+func buildPreResearchPrompt(in proposalInput) string {
+	return fmt.Sprintf(`【当前日期】%s
+【市场状态】regime=%s 置信度=%.2f
+【六维判势】%s
+【组合快照】%s
+【回撤】%s
+【风控】%s
+【多因子候选股票】%s
+【市场共识与次日待验证条件】%s
+请自由研判，不输出 JSON。`,
+		in.Date, in.Regime, in.Confidence, orEmpty(in.SixDim, "无"),
+		orEmpty(in.Portfolio, "无"), orEmpty(in.Drawdown, "无"), orEmpty(in.Risk, "无"),
+		orEmpty(in.Candidates, "无"), orEmpty(in.Consensus, "无"))
 }
 
 // proposalGateResult 决策主张层的门控结果：主张 + 对抗评审 + 多空辩论 + 多提案集成 + 证据链 + 规则风控门后的有效仓位系数。
@@ -618,9 +688,16 @@ type proposalInput struct {
 	Consensus  string // A3 市场共识/分歧/次日待验证条件摘要（可为空）
 }
 
-// buildProposalPrompt 将证据拼装为输入提示
-func buildProposalPrompt(in proposalInput) string {
-	return fmt.Sprintf(`【当前日期】%s
+// buildProposalPrompt 将证据拼装为 Phase B 的 JSON 决策 prompt。
+// preResearch 为 Phase A 前置调研的自然语言研判（可为空），拼在最前面作为"先验判断"，
+// 降低 LLM 在 response_format=json_object 约束下"直接编 JSON 而不看证据"的风险。
+func buildProposalPrompt(in proposalInput, preResearch string) string {
+	var sb strings.Builder
+	if preResearch != "" {
+		sb.WriteString(fmt.Sprintf("【Phase A 前置调研研判要点】\n%s\n\n", preResearch))
+		sb.WriteString("（以下证据供你校验上述研判、修正或确认方向；Phase A 研判仅作参考，最终决策以你对证据的判断为准）\n\n")
+	}
+	sb.WriteString(fmt.Sprintf(`【当前日期】%s
 【市场状态】regime=%s 置信度=%.2f
 【六维判势】%s
 【组合快照】%s
@@ -628,10 +705,11 @@ func buildProposalPrompt(in proposalInput) string {
 【风控】%s
 【多因子候选股票】%s
 【市场共识与次日待验证条件】%s
-请基于以上真实证据，给出你的决策主张（方向、建议仓位、偏好个股、信心），只输出 JSON。`,
+请基于以上真实证据（以及 Phase A 研判作参考），给出你的决策主张（方向、建议仓位、偏好个股、信心），只输出 JSON。`,
 		in.Date, in.Regime, in.Confidence, orEmpty(in.SixDim, "无"),
 		orEmpty(in.Portfolio, "无"), orEmpty(in.Drawdown, "无"), orEmpty(in.Risk, "无"),
-		orEmpty(in.Candidates, "无"), orEmpty(in.Consensus, "无"))
+		orEmpty(in.Candidates, "无"), orEmpty(in.Consensus, "无")))
+	return sb.String()
 }
 
 func orEmpty(s, d string) string {
@@ -665,6 +743,48 @@ func (c *CIOEngine) parseDecisionProposal(content string) *llmDecisionProposal {
 		p.Confidence = 100
 	}
 	return &p
+}
+
+// sanitizeDecisionProposal P2 后处理：LLM 输出的统一修正规则。
+// 目标：让 LLM 的 JSON 输出更"硬"——把 LLM 容易犯的小错误（仓位为0、偏好个股含非代码字符、置信度越界）
+//
+//	在 Go 端统一修正，避免后续决策用脏数据。
+func (c *CIOEngine) sanitizeDecisionProposal(p *llmDecisionProposal) *llmDecisionProposal {
+	if p == nil {
+		return nil
+	}
+	// 1) TargetPositionRate clamp 到 [0.2, 1.0]，0 视为未给出主张 → 默认 1.0
+	if p.TargetPositionRate <= 0 {
+		p.TargetPositionRate = 1.0
+	} else if p.TargetPositionRate < 0.2 {
+		p.TargetPositionRate = 0.2
+	} else if p.TargetPositionRate > 1.0 {
+		p.TargetPositionRate = 1.0
+	}
+	// 2) PreferredStocks: 纯代码提取 + 去重 + 去空
+	seen := make(map[string]bool, len(p.PreferredStocks))
+	cleaned := make([]prefStock, 0, len(p.PreferredStocks))
+	for _, ps := range p.PreferredStocks {
+		code := pureCode(ps.Code)
+		if code == "" || seen[code] {
+			continue
+		}
+		seen[code] = true
+		reason := strings.TrimSpace(ps.Reason)
+		if len(reason) > 80 {
+			reason = reason[:80] // 理由截断
+		}
+		cleaned = append(cleaned, prefStock{Code: code, Reason: reason})
+	}
+	p.PreferredStocks = cleaned
+	// 3) 置信度 clamp（parseDecisionProposal 已做，这里保留兜底）
+	if p.Confidence < 0 {
+		p.Confidence = 0
+	}
+	if p.Confidence > 100 {
+		p.Confidence = 100
+	}
+	return p
 }
 
 // lastDecisionFeedback Phase3 归因反馈：读取最近结算日的组合真实收益（PortfolioDailyStat），
