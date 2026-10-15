@@ -13,13 +13,11 @@
 
 ## 📥 立即下载
 
-**👉 [下载 QuantBot v1.7.0（Windows x64，ZIP 免安装包）](https://github.com/jeokeo011222/quantbot/releases/download/v1.7.0/QuantBot-v1.7.0.zip)**
+**👉 [下载 QuantBot v1.8.0（Windows x64，ZIP 免安装包）](https://github.com/jeokeo011222/quantbot/releases/download/v1.8.0/QuantBot-v1.8.0.zip)**
 
 > 下载 → 解压 → 运行 `QuantBot.exe` → 配置 API Key 即可开始。
-
-**🔧 [仅下载决策脑 agent.dll（从源码构建 exe 时使用）](https://github.com/jeokeo011222/quantbot/releases/download/v1.7.0/agent.dll)**
-
-> 源码仓库已**全量开源（含决策脑源码）**。从源码编译 exe 时，直接 `go build` 即可（`internal/brain` + `dll/` 已入库），无需额外下载 DLL。接口与编译调用详见 [agent_dll_guide.md](agent_dll_guide.md)。
+>
+> v1.8.0 起，决策脑已**完整合并进 exe**——一个文件搞定，无需额外 DLL。
 
 <br>
 
@@ -27,7 +25,7 @@
 [![Wails](https://img.shields.io/badge/Wails-v2-C2185B?logo=wails&logoColor=white)](https://wails.io)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![License](https://img.shields.io/badge/License-Proprietary-red.svg)](#-disclaimer)
-[![Release](https://img.shields.io/badge/Release-v1.7.0-2ea44f)](https://github.com/jeokeo011222/quantbot/releases/download/v1.7.0/QuantBot-v1.7.0.zip)
+[![Release](https://img.shields.io/badge/Release-v1.8.0-2ea44f)](https://github.com/jeokeo011222/quantbot/releases/download/v1.8.0/QuantBot-v1.8.0.zip)
 
 **⭐ 如果你觉得 AI + 量化投资很酷，请给这个项目一个 Star**
 
@@ -272,7 +270,7 @@ AI 建立在量化数据和系统状态之上，而不是凭感觉猜股票。
 
 ```bash
 # 1. 下载解压
-# 下载地址：https://github.com/jeokeo011222/quantbot/releases/download/v1.7.0/QuantBot-v1.7.0.zip
+# 下载地址：https://github.com/jeokeo011222/quantbot/releases/download/v1.8.0/QuantBot-v1.8.0.zip
 
 # 2. 运行 QuantBot.exe
 
@@ -292,7 +290,7 @@ go build ./...
 # 前端
 cd ui && npm install && npm run build
 
-# 打包（Wails）
+# 打包（Wails，直接产出单个 exe）
 wails build -platform windows/amd64
 ```
 
@@ -327,6 +325,29 @@ QuantBot 当前采用：
 
 ---
 
+## � v1.8.0 新特性（2026-10）
+
+### 🏗️ 架构升级：决策脑合并进 exe
+
+- **消灭 agent.dll C ABI 边界**：原 `dll/`（6 文件 c-shared 构建）和 `internal/agentdll/`（syscall.LoadDLL 封装）全部下线。决策脑桥接层改为普通 Go 包（`internal/agentbridge/`），**零 CGO / 零 syscall / 零 unsafe**。
+- 拉模式 RPC 总线保留为进程内 channel，跨边界 JSON 编解码开销消除。
+- `wails build` 直接产出**单个 exe**（~74 MB），部署分发只需一个文件。
+
+### 🧠 决策链进化
+
+- **三立场辩论**（aggressive / conservative / neutral）：CIO 不再只是"多空对抗"，而是三个角色各有专属任务——激进派找机会、保守派挑风险、中立派做归纳，每方都有独立的证据链和置信度。
+- **CIO Checkpoint 恢复**：pre_research → proposal → debate → ensemble → portfolio_mgr → done 六阶段可恢复，SQLite upsert + NextStep 跳转。
+- **确定性验证快照**：DuckDB K 线 + 纯数学 MA/RSI/Bollinger/MACD/ATR 计算 + markdown 渲染 + "真理来源约束语"，LLM 不再可能凭空捏造行情。
+- **交易记忆反思闭环**：append-only JSONL 记录决策 → 持仓 → 争议 → 争议解决 → 教训提取，次日盘前自动注入 Planner 上下文。
+
+### ⚙️ 工程改进
+
+- **Benchmark 按市场自动选择**：bj→北证50 / sh688→科创50 / sz300→创业板指 / sh→沪深300 / sz→深证100。
+- **LLM 参数显式校验**：provider name 校验 / temperature ∈ [0,2] / max_retries 0~10 / 类型安全防 bool 当 int。
+- **YAML 调度**：盘前/盘中/盘后工作流用 YAML 编排，不再硬编码时间点。
+
+---
+
 ## 🗺️ Roadmap
 
 QuantBot 目前已经可以完成核心投资工作流。接下来不会无限堆功能，而是：
@@ -335,10 +356,12 @@ QuantBot 目前已经可以完成核心投资工作流。接下来不会无限�
 
 - [x] 多智能体投资决策链
 - [x] 市场六维判势
-- [x] CIO 多空辩论 + Kelly 仓位缩放
+- [x] CIO 多空辩论 + Kelly 仓位缩放 → v1.8.0 升级为三立场辩论
 - [x] 因子分半稳定性检验
 - [x] 17 种内置策略
 - [x] 更完善的组合风险管理
+- [x] 决策脑合并进 exe（消除 DLL 边界）
+
 - [ ] 更好的因子
 - [ ] 社区策略生态
 
