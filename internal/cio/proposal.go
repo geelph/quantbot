@@ -205,9 +205,22 @@ func (c *CIOEngine) genDecisionProposal(ctx context.Context, proposalInput propo
 	if c.agent == nil || c.agent.LLM == nil {
 		return nil
 	}
+	// P0 确定性验证快照：取沪深300指数的 ground truth（让 LLM 有"不能编造"的精确数字锚点）
+	verifiedSnapshot := ""
+	if c.duckDB != nil {
+		tradeDate, _ := time.Parse("2006-01-02", proposalInput.Date)
+		if !tradeDate.IsZero() {
+			if snap, err := c.duckDB.BuildVerifiedSnapshot(ctx, "sh000300", tradeDate, 30); err == nil {
+				verifiedSnapshot = snap.RenderMarkdown()
+			} else {
+				log.Printf("[CIO] 确定性快照跳过(sh000300): %v", err)
+			}
+		}
+	}
+
 	// Phase A: 前置调研（自然语言研判）
-	preResearch := c.runPreliminaryAssessment(ctx, proposalInput)
-	prompt := buildProposalPrompt(proposalInput, preResearch)
+	preResearch := c.runPreliminaryAssessment(ctx, proposalInput, verifiedSnapshot)
+	prompt := buildProposalPrompt(proposalInput, preResearch, verifiedSnapshot)
 
 	// Phase B: 严格 JSON 决策
 	ctx2, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -253,12 +266,13 @@ const preResearchSystemPrompt = `你是A股量化基金的首席研判员。系�
 请用自然语言写，不需要结构化，不需要 JSON，不需要输出其他内容。`
 
 // runPreliminaryAssessment Phase A 前置调研调用。
+// verifiedSnapshot 为 P0 确定性验证快照（可为空），拼到 prompt 里作为 ground truth。
 // 失败/超时/无输出 → 返回空串（静默降级，不阻断 Phase B）。
-func (c *CIOEngine) runPreliminaryAssessment(ctx context.Context, in proposalInput) string {
+func (c *CIOEngine) runPreliminaryAssessment(ctx context.Context, in proposalInput, verifiedSnapshot string) string {
 	if c.agent == nil || c.agent.LLM == nil {
 		return ""
 	}
-	prompt := buildPreResearchPrompt(in)
+	prompt := buildPreResearchPrompt(in, verifiedSnapshot)
 	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second) // Phase A 超时更短（30s vs 60s）
 	defer cancel()
 	resp, err := c.agent.LLM.Chat(ctx2, []agents.Message{
@@ -283,8 +297,14 @@ func (c *CIOEngine) runPreliminaryAssessment(ctx context.Context, in proposalInp
 }
 
 // buildPreResearchPrompt Phase A 的证据拼装（比 Phase B 更精简，只列核心证据）。
-func buildPreResearchPrompt(in proposalInput) string {
-	return fmt.Sprintf(`【当前日期】%s
+func buildPreResearchPrompt(in proposalInput, verifiedSnapshot string) string {
+	var sb strings.Builder
+	if verifiedSnapshot != "" {
+		sb.WriteString("【P0 确定性验证快照（沪深300，ground truth）】\n")
+		sb.WriteString(verifiedSnapshot)
+		sb.WriteString("\n")
+	}
+	sb.WriteString(fmt.Sprintf(`【当前日期】%s
 【市场状态】regime=%s 置信度=%.2f
 【六维判势】%s
 【组合快照】%s
@@ -295,7 +315,8 @@ func buildPreResearchPrompt(in proposalInput) string {
 请自由研判，不输出 JSON。`,
 		in.Date, in.Regime, in.Confidence, orEmpty(in.SixDim, "无"),
 		orEmpty(in.Portfolio, "无"), orEmpty(in.Drawdown, "无"), orEmpty(in.Risk, "无"),
-		orEmpty(in.Candidates, "无"), orEmpty(in.Consensus, "无"))
+		orEmpty(in.Candidates, "无"), orEmpty(in.Consensus, "无")))
+	return sb.String()
 }
 
 // proposalGateResult 决策主张层的门控结果：主张 + 对抗评审 + 多空辩论 + 多提案集成 + 证据链 + 规则风控门后的有效仓位系数。
@@ -327,21 +348,52 @@ const skepticSystemPrompt = `你是A股量化基金的异议审查官（Devil's 
 
 // debateVerdict 多空辩论（Phase3）输出：同一标的/市场看多与看空双方论据 + 共识度。
 type debateVerdict struct {
-	Direction string   `json:"direction"` // BULLISH|BEARISH|NEUTRAL
+	Direction string `json:"direction"` // BULLISH|BEARISH|NEUTRAL
+	// 新三立场格式（TradingAgents 风格）——让 LLM 显式分 aggressive/conservative/neutral
+	Aggressive   []string `json:"aggressive"`
+	Conservative []string `json:"conservative"`
+	Neutral      []string `json:"neutral"`
+	// 旧 bull/bear 格式（向后兼容：解析时会从 aggressive/conservative 回退到 bull/bear）
 	Bull      []string `json:"bull"`
 	Bear      []string `json:"bear"`
-	Agreement int      `json:"agreement"` // 0~100 多空共识度（0=完全分歧，100=完全一致）
+	Agreement int      `json:"agreement"` // 0~100 三立场共识度
 	Summary   string   `json:"summary"`
 }
 
 // debateSystemPrompt 多空辩论裁决官系统提示词：就该主张同时摆出看多与看空论据，并给出共识度。
-const debateSystemPrompt = `你是A股量化基金的辩论裁决官。决策主张官已给出一个投资主张，证据已注入。你的职责是「组织一场多空辩论」：
-1. 站在多头 角度列出 1~3 条最有力的看多论据 bull（每条一句话、落在具体证据上）；
-2. 站在空头 角度列出 1~3 条最有力的看空论据 bear（每条一句话、落在具体风险上）；
-3. 给出方向 direction（BULLISH/BEARISH/NEUTRAL）与共识度 agreement（0~100：论据更偏一致则越高、分歧越大则越低）；
-4. summary 一句话总结这场辩论的净结论。
-要求：论据必须对应注入证据，不得编造；必须严格只输出一个 JSON 对象，不要输出任何其他文字，格式：
-{"direction":"BULLISH|BEARISH|NEUTRAL","bull":["<多头论据1>","<多头论据2>"],"bear":["<空头论据1>","<空头论据2>"],"agreement":0~100,"summary":"<不超过80字>"}`
+// debateSystemPrompt TradingAgents 风格的三立场辩论：
+//
+//	aggressive: 主动寻找机会，反驳保守派的过度谨慎假设
+//	conservative: 主动寻找风险，反驳激进派的乐观假设
+//	neutral: 在两者中找共识，指出双方盲点
+//	judge: 综合三者后给出最终方向、共识度、总结
+//
+// 和原版单轮辩论的区别：原版是"让 LLM 同时扮演多空双方"，
+// 现在是"让 LLM 显式地以三个对立立场各输出一段"——
+// 每个立场都被要求反驳对方、指出盲区，比单纯的正反列点更深入。
+const debateSystemPrompt = `你是A股量化基金的风控辩论主持人。请组织一场三立场辩论，每个立场有专属任务：
+
+【激进派（Aggressive）】
+- 主动寻找当前市场的机会点（哪些板块/风格/标的可能跑赢大盘？）
+- 反驳保守派可能提出的过度谨慎假设（"市场还没起来""风险太大"……）
+- 论据必须落在注入证据上，不得编造
+
+【保守派（Conservative）】
+- 主动寻找当前市场的风险点（哪些风险可能被低估？回调/流动性/基本面/外部……）
+- 反驳激进派可能提出的乐观假设（"这次不一样""政策底已确认"……）
+- 论据必须落在注入证据上，不得编造
+
+【中立派（Neutral）】
+- 在激进派和保守派的论点中找共识（双方都认可的方向/约束）
+- 指出双方共同的盲点（有没有什么证据两边都没覆盖到？）
+
+请输出严格 JSON，格式：
+{"aggressive":["<机会点1>","<机会点2>"],"conservative":["<风险点1>","<风险点2>"],"neutral":["<共识/盲点1>","<共识/盲点2>"],"direction":"BULLISH|BEARISH|NEUTRAL","agreement":0~100,"summary":"<三立场综合结论，不超过100字>"}
+
+- aggressive/conservative/neutral 各 1~3 条论据，每条一句话
+- direction 是三立场辩论后的综合判断
+- agreement（0~100）= 三个立场都认可的程度：都认可则高，分歧大则低
+- 只输出 JSON，不要其他文字`
 
 // kellyPositionScale 用「LLM 主张置信度 × 多空共识度」计算 Kelly 仓位缩放系数。
 // certainty = conf/100 × agreement/100 ∈ [0,1]；scale = 0.4 + 0.6×certainty ∈ [0.4,1]。
@@ -393,7 +445,9 @@ func (c *CIOEngine) debateProposal(ctx context.Context, in proposalInput, prop *
 	return deb
 }
 
-// parseDebateVerdict 解析多空辩论 JSON 输出；非法则返回 nil。
+// parseDebateVerdict 解析辩论 JSON 输出。
+// 同时支持新三立场格式（aggressive/conservative/neutral）和旧 bull/bear 格式。
+// 新格式为空时回退到 bull/bear（向后兼容）。
 func (c *CIOEngine) parseDebateVerdict(content string) *debateVerdict {
 	block := extractJSONBlock(content)
 	if block == "" {
@@ -403,8 +457,20 @@ func (c *CIOEngine) parseDebateVerdict(content string) *debateVerdict {
 	if err := json.Unmarshal([]byte(block), &deb); err != nil {
 		return nil
 	}
-	if deb.Direction == "" || len(deb.Bull) == 0 && len(deb.Bear) == 0 {
+	if deb.Direction == "" {
 		return nil
+	}
+
+	// 向后兼容：新三立场为空时回退到 bull/bear
+	if len(deb.Aggressive) == 0 && len(deb.Bull) > 0 {
+		deb.Aggressive = deb.Bull
+	}
+	if len(deb.Conservative) == 0 && len(deb.Bear) > 0 {
+		deb.Conservative = deb.Bear
+	}
+
+	if len(deb.Aggressive) == 0 && len(deb.Conservative) == 0 && len(deb.Neutral) == 0 {
+		return nil // 完全没论据 → 丢弃
 	}
 	if deb.Agreement < 0 || deb.Agreement > 100 {
 		deb.Agreement = 0
@@ -691,8 +757,13 @@ type proposalInput struct {
 // buildProposalPrompt 将证据拼装为 Phase B 的 JSON 决策 prompt。
 // preResearch 为 Phase A 前置调研的自然语言研判（可为空），拼在最前面作为"先验判断"，
 // 降低 LLM 在 response_format=json_object 约束下"直接编 JSON 而不看证据"的风险。
-func buildProposalPrompt(in proposalInput, preResearch string) string {
+func buildProposalPrompt(in proposalInput, preResearch string, verifiedSnapshot string) string {
 	var sb strings.Builder
+	if verifiedSnapshot != "" {
+		sb.WriteString("【P0 确定性验证快照（沪深300，ground truth）】\n")
+		sb.WriteString(verifiedSnapshot)
+		sb.WriteString("\n")
+	}
 	if preResearch != "" {
 		sb.WriteString(fmt.Sprintf("【Phase A 前置调研研判要点】\n%s\n\n", preResearch))
 		sb.WriteString("（以下证据供你校验上述研判、修正或确认方向；Phase A 研判仅作参考，最终决策以你对证据的判断为准）\n\n")

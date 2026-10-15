@@ -20,7 +20,7 @@ rem NO -clean flag: wails build without -clean keeps all existing
 rem databases, configs and logs under build\bin fully preserved.
 
 rem Check dependencies (explicit paths, independent of terminal PATH)
-set "GO_EXE=D:\go\bin\go.exe"
+set "GO_EXE=%USERPROFILE%\sdk\go1.26.2\bin\go.exe"
 set "WAILS_EXE=C:\Users\JokerZ\go\bin\wails.exe"
 
 if not exist "%GO_EXE%" (
@@ -39,10 +39,10 @@ echo.
 rem Ensure output directory exists
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
-rem Set Go environment variables (consistent with dev environment)
-set "GOROOT=D:\go"
+rem Set Go environment variables
+set "GOROOT=%USERPROFILE%\sdk\go1.26.2"
 set "GOPATH=C:\Users\JokerZ\go"
-set "PATH=D:\go\bin;%GOPATH%\bin;%PATH%"
+set "PATH=%USERPROFILE%\sdk\go1.26.2\bin;%GOPATH%\bin;%PATH%"
 echo [Env] GOROOT=%GOROOT%
 echo [Env] GOPATH=%GOPATH%
 echo.
@@ -77,17 +77,7 @@ echo   Size:   %SIZE_MB% MB
 echo   Date:   %FILE_DATE%
 echo.
 
-rem Copy decision-brain DLL next to the exe (bin\agent.dll -> build\bin\agent.dll)
-if exist "bin\agent.dll" (
-    copy /Y "bin\agent.dll" "%OUTPUT_DIR%\agent.dll" >nul
-    echo [OK] Copied agent.dll
-    if exist "bin\agent.h" (
-        copy /Y "bin\agent.h" "%OUTPUT_DIR%\agent.h" >nul
-        echo [OK] Copied agent.h
-    )
-) else (
-    echo [warn] bin\agent.dll not found; exe will fall back to harness
-)
+rem agent.dll 已合并进主程序（internal/agentbridge），wails build 直接产出单个 exe。
 
 rem Sync bridge strategy folders from third_party (ship with every build)
 if exist "third_party\Ptrade" (
